@@ -28,7 +28,7 @@
 <h1>Audio Transcription</h1>
 <input type="file" id="audioInput" accept="audio/*" />
 <p>OR</p>
-<input type="text" id="youtubeUrl" placeholder="Enter YouTube URL" />
+<input type="text" id="youtubeUrl" placeholder="Not Supported Yet" />
 <button id="transcribeBtn">Transcribe</button>
 <div id="progressBar"><div></div></div>
 <h2>Transcription Result</h2>
@@ -41,6 +41,18 @@
         const youtubeUrl = document.getElementById('youtubeUrl').value.trim();
         const progressBar = document.getElementById('progressBar');
         const progressBarInner = progressBar.querySelector('div');
+        const transcriptionResult = document.getElementById('transcriptionResult');
+        const summaryResult = document.getElementById('summaryResult');
+        const errorDisplay = document.createElement('div');
+        errorDisplay.style.color = 'red';
+        errorDisplay.style.marginTop = '10px';
+
+        // Remove any existing error message
+        const existingError = document.querySelector('div[style="color: red; margin-top: 10px;"]');
+        if (existingError) {
+            existingError.remove();
+        }
+
         if (!audioInput.files.length && !youtubeUrl) {
             alert("Please select an audio file or enter a YouTube URL.");
             return;
@@ -56,11 +68,17 @@
         try {
             progressBar.style.display = 'block';
             progressBarInner.style.width = '0%';
+            transcriptionResult.value = '';
+            summaryResult.value = '';
+            errorDisplay.textContent = '';
 
-            const eventSource = new EventSource('/transcribe-progress');
-            eventSource.onmessage = function(event) {
-                const progress = JSON.parse(event.data);
-                progressBarInner.style.width = progress.percent + '%';
+            // Set up WebSocket connection
+            const ws = new WebSocket(`ws://${window.location.host}`);
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                if (data.type === 'progress') {
+                    progressBarInner.style.width = data.value + '%';
+                }
             };
 
             const response = await fetch('/transcribe', {
@@ -68,17 +86,20 @@
                 body: formData,
             });
 
-            eventSource.close();
-
-            if (!response.ok) {
-                throw new Error('Transcription failed');
-            }
+            ws.close();
 
             const data = await response.json();
-            document.getElementById('transcriptionResult').value = data.transcription;
-            document.getElementById('summaryResult').value = data.summary;
+
+            if (!response.ok) {
+                throw new Error(data.error || `Transcription failed: ${response.status} ${response.statusText}`);
+            }
+
+            transcriptionResult.value = data.transcription;
+            summaryResult.value = data.summary;
         } catch (error) {
-            alert("Transcription failed: " + error.message);
+            console.error('Error:', error);
+            errorDisplay.textContent = "Error: " + error.message;
+            document.body.appendChild(errorDisplay);
         } finally {
             progressBar.style.display = 'none';
         }

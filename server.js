@@ -4,8 +4,8 @@ const path = require('path');
 const OpenAI = require("openai");
 const ytdl = require('ytdl-core');
 const fs = require('fs');
-
 const app = express();
+
 const upload = multer({ 
   dest: 'uploads/',
   storage: multer.diskStorage({
@@ -41,16 +41,22 @@ try {
 // Serve static files from the current directory
 app.use(express.static(__dirname));
 
-// Transcribe route
 app.post('/transcribe', upload.single('file'), async (req, res) => {
   try {
+    sendProgressUpdate(25); // Send 50% progress before starting transcription
     console.log('Transcription request received');
     let audioPath;
+    let trimmedAudioPath;
     if (req.file) {
       audioPath = req.file.path;
       console.log(`File uploaded: ${audioPath}`);
-    } else if (req.body.youtube_url) { // TODO: This is hanging on the video download
+      
+      audioPath = req.file.path;
+    } else if (req.body.youtube_url) {
       const videoId = ytdl.getVideoID(req.body.youtube_url);
+      audioPath = path.join(uploadsDir, `${videoId}.mp3`);
+      await downloadAudio(videoId, audioPath);
+      
       audioPath = path.join(uploadsDir, `${videoId}.mp3`);
       await downloadAudio(videoId, audioPath);
     } else {
@@ -64,7 +70,7 @@ app.post('/transcribe', upload.single('file'), async (req, res) => {
       model: "whisper-1",
     });
     console.log('Transcription complete');
-
+    sendProgressUpdate(75); // Send 75% progress after transcription is complete
     if (!req.file) {
       console.log(`Deleting downloaded YouTube audio: ${audioPath}`);
       fs.unlinkSync(audioPath); // Delete the downloaded YouTube audio
@@ -74,6 +80,7 @@ app.post('/transcribe', upload.single('file'), async (req, res) => {
 
     // Summarize the transcription
     console.log('Starting summarization');
+    sendProgressUpdate(80); // Send 80% progress before starting summarization
     const summary = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: [
@@ -82,15 +89,27 @@ app.post('/transcribe', upload.single('file'), async (req, res) => {
       ],
     });
     console.log('Summarization complete');
-
+    sendProgressUpdate(95); // Send 95% progress after summarization is complete
     console.log('Sending transcription and summary response');
+    sendProgressUpdate(100); // Send 100% progress before sending the final response
     res.json({ 
       transcription: transcription.text,
       summary: summary.choices[0].message.content
     });
   } catch (error) {
     console.error('Transcription or summarization failed:', error);
-    res.status(500).json({ error: 'Transcription or summarization failed', details: error.message });
+    let errorMessage = 'Transcription or summarization failed';
+    let statusCode = 500;
+
+    if (error.status === 413 && error.error && error.error.message) {
+      errorMessage = `The audio file is too large. ${error.error.message}`;
+      statusCode = 413;
+    } else if (error.message) {
+      errorMessage += ': ' + error.message;
+    }
+
+    console.log('Sending error response:', { error: errorMessage, status: statusCode });
+    res.status(statusCode).json({ error: errorMessage, status: statusCode });
   }
 });
 
@@ -98,23 +117,50 @@ app.post('/transcribe', upload.single('file'), async (req, res) => {
 async function downloadAudio(videoId, audioPath) {
   return new Promise(async (resolve, reject) => {
     try {
+      // Check if the file already exists
+      if (fs.existsSync(audioPath)) {
+        console.log('Audio file already exists, using cached version');
+        return resolve();
+      }
+
       const info = await ytdl.getInfo(videoId);
       const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-      const stream = ytdl.downloadFromInfo(info, { format: audioFormats[0] })
-        .pipe(fs.createWriteStream(audioPath));
+      const stream = ytdl.downloadFromInfo(info, { format: audioFormats[0] });
+      
+      let downloadedBytes = 0;
+      const maxBytes = 26214400; // 25 MB (OpenAI's limit)
+      
+      const writeStream = fs.createWriteStream(audioPath);
+
+      stream.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+        if (downloadedBytes > maxBytes) {
+          stream.destroy();
+          writeStream.end();
+          console.log(`Download capped at ${maxBytes} bytes`);
+          sendProgressUpdate(100); // Send 100% progress when download is complete
+          resolve(); // Resolve the promise here to continue processing
+        } else {
+          const progress = Math.min(100, Math.round((downloadedBytes / maxBytes) * 100));
+          sendProgressUpdate(progress);
+        }
+      });
+
+      stream.pipe(writeStream);
 
       const timeout = setTimeout(() => {
         stream.destroy();
+        writeStream.end();
         reject(new Error('Download timed out'));
       }, 300000); // 5 minutes timeout
 
-      stream.on('finish', () => {
+      writeStream.on('finish', () => {
         clearTimeout(timeout);
         console.log('YouTube audio download complete');
         resolve();
       });
 
-      stream.on('error', (err) => {
+      writeStream.on('error', (err) => {
         clearTimeout(timeout);
         console.error('Stream error:', err);
         reject(err);
@@ -125,15 +171,40 @@ async function downloadAudio(videoId, audioPath) {
   });
 }
 
-// SSE route for progress updates
-app.get('/transcribe-progress', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders(); // flush the headers to establish SSE with the client
+// Function to check if audio file is within size limit
+function checkAudioSize(filePath, maxSizeBytes = 25 * 1024 * 1024) {
+  const stat = fs.statSync(filePath);
+  if (stat.size > maxSizeBytes) {
+    throw new Error(`Audio file size exceeds the limit of ${maxSizeBytes / (1024 * 1024)} MB`);
+  }
+}
+
+const WebSocket = require('ws');
+const server = require('http').createServer(app);
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('WebSocket client connected');
+  
+  ws.on('message', (message) => {
+    console.log('Received message:', message);
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket client disconnected');
+  });
 });
 
+// Function to send progress updates
+function sendProgressUpdate(progress) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: 'progress', value: progress }));
+    }
+  });
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
